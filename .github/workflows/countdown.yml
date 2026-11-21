@@ -343,6 +343,7 @@ jobs:
           # ---------------------------------------------------------------- Ablauf
 
           MAX_RUNTIME = dt.timedelta(minutes=330)
+          POLL = dt.timedelta(minutes=30)
 
 
           def restart_self():
@@ -398,19 +399,21 @@ jobs:
                   force = False
                   json.dump(state, open(STATE_FILE, "w"), indent=2)
 
-                  # Solange ein Event ansteht oder laeuft, bleibt das Programm wach (der GitHub-Timer
-                  # ist zu unzuverlaessig). Kurz vor dem Zeitlimit startet es sich selbst neu.
-                  if found is None or change_at is None:
-                      break
-                  if change_at - started > MAX_RUNTIME:
+                  # Das Programm bleibt immer wach (GitHubs Timer ist zu unzuverlaessig): es wartet bis
+                  # zum naechsten Bildwechsel, schaut aber spaetestens alle 30 Minuten nach neuen Events.
+                  # Kurz vor dem Zeitlimit von GitHub startet es sich selbst neu.
+                  poll_at = now + POLL
+                  wake_at = change_at if change_at is not None and change_at <= poll_at else poll_at
+                  if wake_at - started > MAX_RUNTIME:
                       restart_self()
                       break
-                  nxt_key, nxt_text, _ = desired(change_at + dt.timedelta(seconds=1), found)
-                  if found and change_at >= found[2]:
-                      nxt_key, nxt_text = "base", None
-                  ensure(nxt_key, nxt_text)  # Bild schon vorher hochladen, damit es puenktlich da ist
-                  wait = (change_at - dt.datetime.now(dt.timezone.utc)).total_seconds() + 2
-                  print(f"  Naechster Wechsel um {change_at:%H:%M} UTC, warte {int(wait // 60)} Min.")
+                  if wake_at == change_at:
+                      nxt_key, nxt_text, _ = desired(change_at + dt.timedelta(seconds=1), found)
+                      if found and change_at >= found[2]:
+                          nxt_key, nxt_text = "base", None
+                      ensure(nxt_key, nxt_text)  # Bild schon vorher hochladen, damit es puenktlich da ist
+                  wait = (wake_at - dt.datetime.now(dt.timezone.utc)).total_seconds() + 2
+                  print(f"  Naechster Blick um {wake_at:%H:%M} UTC.")
                   if wait > 0:
                       time.sleep(wait)
 
@@ -433,3 +436,13 @@ jobs:
           git config user.email "countdown-bot@users.noreply.github.com"
           for f in icon.png countdown-state.json; do [ -f "$f" ] && git add "$f"; done
           git diff --cached --quiet || (git commit -m "Countdown-Symbol aktualisiert" && git push)
+
+      - name: Nach Fehler neu starten
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sleep 300
+          curl -s -X POST -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/countdown.yml/dispatches" \
+            -d '{"ref":"main"}'
