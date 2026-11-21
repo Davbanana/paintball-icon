@@ -8,6 +8,11 @@ on:
   schedule:
     - cron: "7 * * * *"   # jede Stunde
   workflow_dispatch:       # Knopf "Run workflow" zum Testen
+    inputs:
+      force:
+        description: "Symbol neu setzen, auch wenn es schon stimmt"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -36,6 +41,7 @@ jobs:
           PLACE_ID: ${{ vars.PLACE_ID }}
           CREATOR_USER_ID: ${{ vars.CREATOR_USER_ID }}
           CREATOR_GROUP_ID: ${{ vars.CREATOR_GROUP_ID }}
+          FORCE: ${{ github.event.inputs.force == 'true' && '1' || '' }}
         run: |
           cat > /tmp/countdown.py <<'PY'
           """Event-Countdown-Symbol fuer ein Roblox-Spiel.
@@ -266,6 +272,19 @@ jobs:
                                  params={"updateMask": "icon"},
                                  files={"request": (None, json.dumps(req), "application/json")})
               check(r, "Symbol setzen")
+              op = r.json() if r.text else {}
+              print("Antwort von Roblox:", json.dumps(op)[:800])
+              path = op.get("path", "")
+              if path.startswith("operations/"):
+                  for _ in range(40):
+                      if op.get("done"):
+                          break
+                      time.sleep(3)
+                      op = check(requests.get(f"{API}/assets/v1/{path}", headers=headers(), timeout=30),
+                                 "Symbol-Status")
+                  print("Ergebnis:", json.dumps(op)[:800])
+                  if op.get("error"):
+                      sys.exit(f"Roblox hat das Symbol nicht gesetzt: {op['error']}")
 
 
           def download_current_icon() -> bytes:
@@ -303,7 +322,7 @@ jobs:
                   want = "base"
                   print("Kein Event in den naechsten 24 Stunden.")
 
-              if want == showing and state.get("base_hash", base_hash) == base_hash:
+              if want == showing and state.get("base_hash", base_hash) == base_hash and not os.environ.get("FORCE"):
                   print("Symbol ist schon richtig, nichts zu tun.")
               else:
                   if want not in cache:
