@@ -17,6 +17,7 @@ on:
 
 permissions:
   contents: write
+  actions: write
 
 concurrency:
   group: countdown-icon
@@ -25,7 +26,7 @@ concurrency:
 jobs:
   icon:
     runs-on: ubuntu-latest
-    timeout-minutes: 150
+    timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4
 
@@ -44,6 +45,7 @@ jobs:
           CREATOR_USER_ID: ${{ vars.CREATOR_USER_ID }}
           CREATOR_GROUP_ID: ${{ vars.CREATOR_GROUP_ID }}
           FORCE: ${{ github.event.inputs.force == 'true' && '1' || '' }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           cat > /tmp/countdown.py <<'PY'
           """Event-Countdown-Symbol fuer ein Roblox-Spiel.
@@ -340,7 +342,19 @@ jobs:
 
           # ---------------------------------------------------------------- Ablauf
 
-          MAX_RUNTIME = dt.timedelta(minutes=140)
+          MAX_RUNTIME = dt.timedelta(minutes=330)
+
+
+          def restart_self():
+              repo, token = os.environ.get("GITHUB_REPOSITORY"), os.environ.get("GITHUB_TOKEN")
+              if not repo or not token:
+                  print("  Kann mich nicht selbst neu starten (kein GITHUB_TOKEN).")
+                  return
+              r = requests.post(f"https://api.github.com/repos/{repo}/actions/workflows/countdown.yml/dispatches",
+                                headers={"Authorization": f"Bearer {token}",
+                                         "Accept": "application/vnd.github+json"},
+                                json={"ref": "main"}, timeout=30)
+              print(f"  Neustart angefordert (HTTP {r.status_code}).")
 
 
           def main():
@@ -384,11 +398,12 @@ jobs:
                   force = False
                   json.dump(state, open(STATE_FILE, "w"), indent=2)
 
-                  # wach bleiben, wenn die naechste Aenderung bald kommt (fuer 10- und 2-Minuten-Schritte)
-                  awake = found is not None and (
-                      (want != "now" and found[1] - now <= dt.timedelta(minutes=95)) or
-                      (want == "now" and found[2] - now <= dt.timedelta(minutes=65)))
-                  if not awake or change_at is None or change_at - started > MAX_RUNTIME:
+                  # Solange ein Event ansteht oder laeuft, bleibt das Programm wach (der GitHub-Timer
+                  # ist zu unzuverlaessig). Kurz vor dem Zeitlimit startet es sich selbst neu.
+                  if found is None or change_at is None:
+                      break
+                  if change_at - started > MAX_RUNTIME:
+                      restart_self()
                       break
                   nxt_key, nxt_text, _ = desired(change_at + dt.timedelta(seconds=1), found)
                   if found and change_at >= found[2]:
