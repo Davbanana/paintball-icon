@@ -1,7 +1,8 @@
 # Event-Countdown-Symbol fuer dein Roblox-Spiel.
 # Laeuft jede Stunde von selbst. 24 Stunden vor jedem Roblox-Event
-# zeigt dein Spiel-Symbol eine Sanduhr + "24 HOURS", "23 HOURS" ... "1 HOUR".
-# Danach kommt dein normales Symbol zurueck.
+# zeigt dein Spiel-Symbol eine Sanduhr + "24 HOURS" ... "1 HOUR",
+# dann "50 MIN" ... "10 MIN", dann "8 MIN", "6 MIN" und 5 Minuten vorher "NOW".
+# Nach dem Event kommt dein normales Symbol zurueck.
 name: Event Countdown Icon
 
 on:
@@ -24,6 +25,7 @@ concurrency:
 jobs:
   icon:
     runs-on: ubuntu-latest
+    timeout-minutes: 150
     steps:
       - uses: actions/checkout@v4
 
@@ -150,7 +152,7 @@ jobs:
               return layer.resize((w // s * size // SIZE, h // s * size // SIZE), Image.LANCZOS)
 
 
-          def render_countdown(base_png: bytes, hours: int) -> bytes:
+          def render_countdown(base_png: bytes, text: str) -> bytes:
               base = Image.open(io.BytesIO(base_png)).convert("RGBA").resize((SIZE, SIZE), Image.LANCZOS)
               img = ImageEnhance.Brightness(base.filter(ImageFilter.GaussianBlur(3))).enhance(0.5)
               # leichte Abdunklung nach unten fuer lesbaren Text
@@ -168,7 +170,6 @@ jobs:
               img.alpha_composite(shadow.filter(ImageFilter.GaussianBlur(8)), (gx + 6, gy + 8))
               img.alpha_composite(glass, (gx, gy))
 
-              text = "1 HOUR" if hours == 1 else f"{hours} HOURS"
               size = 110
               while size > 40:
                   font = load_font(size)
@@ -210,9 +211,14 @@ jobs:
               return r.json() if r.text else {}
 
 
-          def next_event(now):
+          def parse_time(value):
+              return dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+          def current_event(now):
+              """Laufendes Event oder das naechste, das in den naechsten 24 Stunden startet."""
               params = {
-                  "startsAfter": now.isoformat().replace("+00:00", "Z"),
+                  "endsAfter": now.isoformat().replace("+00:00", "Z"),
                   "startsBefore": (now + dt.timedelta(hours=WINDOW_HOURS)).isoformat().replace("+00:00", "Z"),
                   "pageSize": 50,
               }
@@ -223,11 +229,47 @@ jobs:
               for ev in events:
                   if str(ev.get("visibility", "public")).lower() == "private":
                       continue  # Entwuerfe ignorieren
-                  start = dt.datetime.fromisoformat(ev["startTime"].replace("Z", "+00:00"))
-                  if now < start <= now + dt.timedelta(hours=WINDOW_HOURS):
-                      if best is None or start < best[1]:
-                          best = (ev, start)
+                  start = parse_time(ev["startTime"])
+                  end = parse_time(ev["endTime"]) if ev.get("endTime") else start + dt.timedelta(hours=1)
+                  if end <= now or start > now + dt.timedelta(hours=WINDOW_HOURS):
+                      continue
+                  if best is None or start < best[1]:
+                      best = (ev, start, end)
               return best
+
+
+          # Schwellen in Sekunden vor dem Start, an denen das Bild wechselt
+          THRESHOLDS = sorted([h * 3600 for h in range(2, WINDOW_HOURS + 1)]
+                              + [60 * 60, 50 * 60, 40 * 60, 30 * 60, 20 * 60, 10 * 60, 8 * 60, 6 * 60, 5 * 60])
+
+
+          def label_for(seconds_left):
+              """(Schluessel, Text) fuer die Restzeit bis zum Start."""
+              if seconds_left <= 5 * 60:
+                  return "now", "NOW"
+              if seconds_left > 3600:
+                  h = math.ceil(seconds_left / 3600)
+                  return f"h{h}", f"{h} HOURS"
+              if seconds_left > 50 * 60:
+                  return "h1", "1 HOUR"
+              if seconds_left > 10 * 60:
+                  m = math.ceil(seconds_left / 600) * 10
+                  return f"m{m}", f"{m} MIN"
+              m = math.ceil(seconds_left / 120) * 2
+              return f"m{m}", f"{m} MIN"
+
+
+          def desired(now, found):
+              """Was jetzt angezeigt werden soll und wann es sich als naechstes aendert."""
+              if not found:
+                  return "base", None, None
+              ev, start, end = found
+              left = (start - now).total_seconds()
+              if left <= 5 * 60:
+                  return "now", "NOW", end          # NOW bis das Event vorbei ist
+              key, text = label_for(left)
+              lower = max(t for t in THRESHOLDS if t < left)
+              return key, text, start - dt.timedelta(seconds=lower)
 
 
           def creator():
@@ -298,8 +340,11 @@ jobs:
 
           # ---------------------------------------------------------------- Ablauf
 
+          MAX_RUNTIME = dt.timedelta(minutes=140)
+
+
           def main():
-              now = dt.datetime.now(dt.timezone.utc)
+              started = dt.datetime.now(dt.timezone.utc)
               state = json.load(open(STATE_FILE)) if os.path.exists(STATE_FILE) else {}
               showing = state.get("showing", "base")
 
@@ -311,32 +356,53 @@ jobs:
               base_png = open(ICON_FILE, "rb").read()
               base_hash = hashlib.sha1(base_png).hexdigest()[:12]
               cache = state.setdefault("assets", {}).setdefault(base_hash + "-openuse", {})
+              force = bool(os.environ.get("FORCE"))
 
-              found = next_event(now)
-              if found:
-                  ev, start = found
-                  hours = max(1, min(WINDOW_HOURS, math.ceil((start - now).total_seconds() / 3600)))
-                  want = f"h{hours}"
-                  print(f"Event '{ev.get('title')}' startet {start:%Y-%m-%d %H:%M} UTC -> {hours} HOURS")
-              else:
-                  want = "base"
-                  print("Kein Event in den naechsten 24 Stunden.")
+              def ensure(key, text):
+                  if key not in cache:
+                      png = base_png if key == "base" else render_countdown(base_png, text)
+                      cache[key] = upload_image(png, "Game Icon" if key == "base" else f"Countdown {text}")
+                      json.dump(state, open(STATE_FILE, "w"), indent=2)
+                  return cache[key]
 
-              if want == showing and state.get("base_hash", base_hash) == base_hash and not os.environ.get("FORCE"):
-                  print("Symbol ist schon richtig, nichts zu tun.")
-              else:
-                  if want not in cache:
-                      png = base_png if want == "base" else render_countdown(base_png, hours)
-                      cache[want] = upload_image(png, "Game Icon" if want == "base" else f"Countdown {hours}h")
-                  set_place_icon(cache[want])
-                  state["showing"] = want
-                  state["base_hash"] = base_hash
-                  print(f"Symbol gesetzt: {want} (Asset {cache[want]})")
+              while True:
+                  now = dt.datetime.now(dt.timezone.utc)
+                  found = current_event(now)
+                  want, text, change_at = desired(now, found)
+                  if found:
+                      print(f"{now:%H:%M:%S} UTC  Event '{found[0].get('title')}' startet {found[1]:%Y-%m-%d %H:%M} UTC -> {text}")
+                  else:
+                      print(f"{now:%H:%M:%S} UTC  Kein Event in den naechsten 24 Stunden.")
+
+                  if want == showing and state.get("base_hash", base_hash) == base_hash and not force:
+                      print("  Symbol ist schon richtig.")
+                  else:
+                      set_place_icon(ensure(want, text))
+                      showing = state["showing"] = want
+                      state["base_hash"] = base_hash
+                      print(f"  Symbol gesetzt: {text or 'normales Symbol'}")
+                  force = False
+                  json.dump(state, open(STATE_FILE, "w"), indent=2)
+
+                  # wach bleiben, wenn die naechste Aenderung bald kommt (fuer 10- und 2-Minuten-Schritte)
+                  awake = found is not None and (
+                      (want != "now" and found[1] - now <= dt.timedelta(minutes=95)) or
+                      (want == "now" and found[2] - now <= dt.timedelta(minutes=65)))
+                  if not awake or change_at is None or change_at - started > MAX_RUNTIME:
+                      break
+                  nxt_key, nxt_text, _ = desired(change_at + dt.timedelta(seconds=1), found)
+                  if found and change_at >= found[2]:
+                      nxt_key, nxt_text = "base", None
+                  ensure(nxt_key, nxt_text)  # Bild schon vorher hochladen, damit es puenktlich da ist
+                  wait = (change_at - dt.datetime.now(dt.timezone.utc)).total_seconds() + 2
+                  print(f"  Naechster Wechsel um {change_at:%H:%M} UTC, warte {int(wait // 60)} Min.")
+                  if wait > 0:
+                      time.sleep(wait)
 
               # einmal pro Woche speichern, damit GitHub den Zeitplan nicht abschaltet
+              now = dt.datetime.now(dt.timezone.utc)
               if state.get("keepalive", "") < (now - dt.timedelta(days=7)).isoformat():
                   state["keepalive"] = now.isoformat()
-
               json.dump(state, open(STATE_FILE, "w"), indent=2)
 
 
