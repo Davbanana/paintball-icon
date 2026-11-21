@@ -242,7 +242,7 @@ jobs:
                   "assetType": "Image",
                   "displayName": name,
                   "description": "Game icon (event countdown)",
-                  "creationContext": {"creator": creator()},
+                  "creationContext": {"creator": creator(), "assetPrivacy": "OpenUse"},
               }
               r = requests.post(f"{API}/assets/v1/assets", headers=headers(), timeout=60, files={
                   "request": (None, json.dumps(req), "application/json"),
@@ -310,7 +310,7 @@ jobs:
                   print("Dein normales Symbol wurde als icon.png gespeichert.")
               base_png = open(ICON_FILE, "rb").read()
               base_hash = hashlib.sha1(base_png).hexdigest()[:12]
-              cache = state.setdefault("assets", {}).setdefault(base_hash, {})
+              cache = state.setdefault("assets", {}).setdefault(base_hash + "-openuse", {})
 
               found = next_event(now)
               if found:
