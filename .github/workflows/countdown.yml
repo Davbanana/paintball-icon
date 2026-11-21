@@ -1,0 +1,335 @@
+# Event-Countdown-Symbol fuer dein Roblox-Spiel.
+# Laeuft jede Stunde von selbst. 24 Stunden vor jedem Roblox-Event
+# zeigt dein Spiel-Symbol eine Sanduhr + "24 HOURS", "23 HOURS" ... "1 HOUR".
+# Danach kommt dein normales Symbol zurueck.
+name: Event Countdown Icon
+
+on:
+  schedule:
+    - cron: "7 * * * *"   # jede Stunde
+  workflow_dispatch:       # Knopf "Run workflow" zum Testen
+
+permissions:
+  contents: write
+
+concurrency:
+  group: countdown-icon
+  cancel-in-progress: false
+
+jobs:
+  icon:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Pakete installieren
+        run: pip install pillow requests
+
+      - name: Symbol aktualisieren
+        env:
+          ROBLOX_API_KEY: ${{ secrets.ROBLOX_API_KEY }}
+          UNIVERSE_ID: ${{ vars.UNIVERSE_ID }}
+          PLACE_ID: ${{ vars.PLACE_ID }}
+          CREATOR_USER_ID: ${{ vars.CREATOR_USER_ID }}
+          CREATOR_GROUP_ID: ${{ vars.CREATOR_GROUP_ID }}
+        run: |
+          cat > /tmp/countdown.py <<'PY'
+          """Event-Countdown-Symbol fuer ein Roblox-Spiel.
+
+          Laeuft jede Stunde (GitHub Actions). Wenn in den naechsten 24 Stunden ein
+          Roblox-Event startet, wird das Spiel-Symbol durch dein Symbol + Sanduhr +
+          "X HOURS" ersetzt. Wenn kein Event ansteht (oder es gestartet ist), kommt
+          dein normales Symbol zurueck.
+
+          Benoetigte Secrets / Variablen:
+            ROBLOX_API_KEY   - Open-Cloud-API-Schluessel (asset:read, asset:write,
+                               universe.event:read, Zugriff auf das Spiel)
+            UNIVERSE_ID      - Universe-ID des Spiels
+            PLACE_ID         - Place-ID des Startplatzes
+            CREATOR_USER_ID  - deine Roblox-User-ID  (ODER CREATOR_GROUP_ID)
+          """
+          import datetime as dt
+          import hashlib
+          import io
+          import json
+          import math
+          import os
+          import sys
+          import time
+
+          import requests
+          from PIL import Image, ImageChops, ImageDraw, ImageEnhance, ImageFilter, ImageFont
+
+          API = "https://apis.roblox.com"
+          STATE_FILE = "countdown-state.json"
+          ICON_FILE = "icon.png"
+          SIZE = 512
+          WINDOW_HOURS = 24
+
+          FONT_CANDIDATES = [
+              "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+              "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+              "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
+          ]
+
+
+          # ---------------------------------------------------------------- Bild
+
+          def load_font(size):
+              for path in FONT_CANDIDATES:
+                  if os.path.exists(path):
+                      return ImageFont.truetype(path, size)
+              return ImageFont.load_default(size)
+
+
+          def draw_hourglass(size):
+              """Runde weisse Sanduhr mit schwarzem Rand, 4x gross gezeichnet fuer glatte Kanten."""
+              s = 4
+              w, h = 220 * s, 260 * s
+              layer = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+              d = ImageDraw.Draw(layer)
+              white, black = (255, 255, 255, 255), (0, 0, 0, 255)
+              bar_h, bar_r = 30 * s, 14 * s
+              cx, mid = w // 2, h // 2
+              top, bottom = bar_h - 4 * s, h - bar_h + 4 * s
+              half = mid - top
+              max_w, neck = 80 * s, 20 * s
+
+              def width(u):  # u: 0 = Engstelle, 1 = Leiste
+                  bulge = math.sin(u * math.pi / 2) ** 0.55
+                  return neck + (max_w - neck) * bulge * (1 - 0.10 * u ** 8)
+
+              steps = 60
+              right_top = [(cx + width(i / steps), mid - half * i / steps) for i in range(steps + 1)]
+              right_bot = [(cx + width(i / steps), mid + half * i / steps) for i in range(steps + 1)]
+              outline = (right_top[::-1] + right_bot
+                         + [(2 * cx - x, y) for x, y in right_bot[::-1]]
+                         + [(2 * cx - x, y) for x, y in right_top])
+              line = 13 * s
+
+              # Sand: Glasform als Maske, damit der Sand genau ins Glas passt
+              inside = Image.new("L", (w, h), 0)
+              ImageDraw.Draw(inside).polygon(outline, fill=255)
+              sand = Image.new("L", (w, h), 0)
+              sd = ImageDraw.Draw(sand)
+              level_top = mid - half * 0.42           # Rest oben (Oberflaeche leicht eingedellt)
+              dip = [(x, level_top + 14 * s * math.cos((x - cx) / max_w * math.pi / 2))
+                     for x in range(cx - max_w, cx + max_w + 1, s)]
+              sd.polygon(dip + [(cx + max_w, mid), (cx - max_w, mid)], fill=255)
+              pile_h = half * 0.55                    # runder Haufen unten
+              mound = [(x, bottom - pile_h * (0.45 + 0.55 * math.cos((x - cx) / max_w * math.pi / 2) ** 1.5))
+                       for x in range(cx - max_w, cx + max_w + 1, s)]
+              sd.polygon(mound + [(cx + max_w, h), (cx - max_w, h)], fill=255)
+              sd.line([(cx, mid), (cx, bottom - pile_h)], fill=255, width=6 * s)  # Sandstrahl
+              sand = ImageChops.multiply(sand, inside)
+              layer.paste(white, (0, 0), sand)
+
+              pts = outline + [outline[0]]
+              d.line(pts, fill=white, width=line)
+              r = line / 2
+              for x, y in pts:  # runde Uebergaenge ohne Zacken
+                  d.ellipse((x - r, y - r, x + r, y + r), fill=white)
+              for y0 in (0, h - bar_h - 8 * s):
+                  d.rounded_rectangle((4 * s, y0 + 4 * s, w - 4 * s, y0 + bar_h + 4 * s), bar_r, fill=white)
+              # gleichmaessiger schwarzer Rand rundherum
+              border = layer.getchannel("A").filter(ImageFilter.MaxFilter(6 * s + 1))
+              out = Image.new("RGBA", (w, h), black)
+              out.putalpha(border)
+              out.alpha_composite(layer)
+              layer = out
+              return layer.resize((w // s * size // SIZE, h // s * size // SIZE), Image.LANCZOS)
+
+
+          def render_countdown(base_png: bytes, hours: int) -> bytes:
+              base = Image.open(io.BytesIO(base_png)).convert("RGBA").resize((SIZE, SIZE), Image.LANCZOS)
+              img = ImageEnhance.Brightness(base.filter(ImageFilter.GaussianBlur(3))).enhance(0.5)
+              # leichte Abdunklung nach unten fuer lesbaren Text
+              shade = Image.new("L", (1, SIZE))
+              for y in range(SIZE):
+                  shade.putpixel((0, y), int(150 * max(0, (y - 250) / 262)))
+              img = Image.composite(Image.new("RGBA", (SIZE, SIZE), (0, 0, 0, 255)), img,
+                                    shade.resize((SIZE, SIZE)))
+
+              glass = draw_hourglass(SIZE)
+              gx = (SIZE - glass.width) // 2
+              gy = 30
+              shadow = Image.new("RGBA", glass.size, (0, 0, 0, 0))
+              shadow.putalpha(glass.getchannel("A").point(lambda a: a * 0.6))
+              img.alpha_composite(shadow.filter(ImageFilter.GaussianBlur(8)), (gx + 6, gy + 8))
+              img.alpha_composite(glass, (gx, gy))
+
+              text = "1 HOUR" if hours == 1 else f"{hours} HOURS"
+              size = 110
+              while size > 40:
+                  font = load_font(size)
+                  box = ImageDraw.Draw(img).textbbox((0, 0), text, font=font, stroke_width=10)
+                  if box[2] - box[0] <= SIZE - 36:
+                      break
+                  size -= 2
+              tw, th = box[2] - box[0], box[3] - box[1]
+              tx = (SIZE - tw) // 2 - box[0]
+              ty = 470 - th - box[1]
+              txt_shadow = Image.new("RGBA", (SIZE, SIZE), (0, 0, 0, 0))
+              ImageDraw.Draw(txt_shadow).text((tx + 5, ty + 7), text, font=font, fill=(0, 0, 0, 200),
+                                              stroke_width=10, stroke_fill=(0, 0, 0, 200))
+              img.alpha_composite(txt_shadow.filter(ImageFilter.GaussianBlur(4)))
+              ImageDraw.Draw(img).text((tx, ty), text, font=font, fill=(255, 255, 255, 255),
+                                       stroke_width=10, stroke_fill=(0, 0, 0, 255))
+
+              out = io.BytesIO()
+              img.convert("RGB").save(out, "PNG")
+              return out.getvalue()
+
+
+          # ---------------------------------------------------------------- Roblox API
+
+          def env(name, required=True):
+              val = os.environ.get(name, "").strip()
+              if required and not val:
+                  sys.exit(f"Fehlt: {name} (in GitHub unter Settings > Secrets and variables > Actions eintragen)")
+              return val
+
+
+          def headers():
+              return {"x-api-key": env("ROBLOX_API_KEY")}
+
+
+          def check(r, what):
+              if r.status_code >= 300:
+                  sys.exit(f"{what} fehlgeschlagen: HTTP {r.status_code} {r.text[:500]}")
+              return r.json() if r.text else {}
+
+
+          def next_event(now):
+              params = {
+                  "startsAfter": now.isoformat().replace("+00:00", "Z"),
+                  "startsBefore": (now + dt.timedelta(hours=WINDOW_HOURS)).isoformat().replace("+00:00", "Z"),
+                  "pageSize": 50,
+              }
+              r = requests.get(f"{API}/virtual-events/v3/universes/{env('UNIVERSE_ID')}/game-events",
+                               headers=headers(), params=params, timeout=30)
+              events = check(r, "Events abrufen").get("gameEvents") or []
+              best = None
+              for ev in events:
+                  if str(ev.get("visibility", "public")).lower() == "private":
+                      continue  # Entwuerfe ignorieren
+                  start = dt.datetime.fromisoformat(ev["startTime"].replace("Z", "+00:00"))
+                  if now < start <= now + dt.timedelta(hours=WINDOW_HOURS):
+                      if best is None or start < best[1]:
+                          best = (ev, start)
+              return best
+
+
+          def creator():
+              group = env("CREATOR_GROUP_ID", required=False)
+              if group:
+                  return {"groupId": group}
+              return {"userId": env("CREATOR_USER_ID")}
+
+
+          def upload_image(png: bytes, name: str) -> str:
+              req = {
+                  "assetType": "Image",
+                  "displayName": name,
+                  "description": "Game icon (event countdown)",
+                  "creationContext": {"creator": creator()},
+              }
+              r = requests.post(f"{API}/assets/v1/assets", headers=headers(), timeout=60, files={
+                  "request": (None, json.dumps(req), "application/json"),
+                  "fileContent": ("icon.png", png, "image/png"),
+              })
+              op = check(r, "Bild hochladen")
+              path = op.get("path") or f"operations/{op.get('operationId')}"
+              for _ in range(40):
+                  if op.get("done"):
+                      break
+                  time.sleep(3)
+                  op = check(requests.get(f"{API}/assets/v1/{path}", headers=headers(), timeout=30),
+                             "Upload-Status")
+              if not op.get("done"):
+                  sys.exit("Upload nicht fertig geworden - naechste Stunde wird es erneut versucht.")
+              resp = op.get("response", {})
+              state = (resp.get("moderationResult") or {}).get("moderationState", "")
+              if state.lower() == "rejected":
+                  sys.exit(f"Roblox hat das Bild '{name}' abgelehnt.")
+              return str(resp["assetId"])
+
+
+          def set_place_icon(asset_id: str):
+              place = env("PLACE_ID")
+              req = {"assetId": place, "icon": f"assets/{asset_id}"}
+              r = requests.patch(f"{API}/assets/v1/assets/{place}", headers=headers(), timeout=60,
+                                 params={"updateMask": "icon"},
+                                 files={"request": (None, json.dumps(req), "application/json")})
+              check(r, "Symbol setzen")
+
+
+          def download_current_icon() -> bytes:
+              r = requests.get("https://thumbnails.roblox.com/v1/games/icons", timeout=30, params={
+                  "universeIds": env("UNIVERSE_ID"), "size": "512x512", "format": "Png", "isCircular": "false"})
+              data = check(r, "Aktuelles Symbol laden").get("data") or []
+              if not data or not data[0].get("imageUrl"):
+                  sys.exit("Konnte dein aktuelles Symbol nicht laden. Lege es als icon.png ins Repository.")
+              return requests.get(data[0]["imageUrl"], timeout=30).content
+
+
+          # ---------------------------------------------------------------- Ablauf
+
+          def main():
+              now = dt.datetime.now(dt.timezone.utc)
+              state = json.load(open(STATE_FILE)) if os.path.exists(STATE_FILE) else {}
+              showing = state.get("showing", "base")
+
+              if not os.path.exists(ICON_FILE):
+                  if showing != "base":
+                      sys.exit("icon.png fehlt, waehrend ein Countdown laeuft. Bitte icon.png hochladen.")
+                  open(ICON_FILE, "wb").write(download_current_icon())
+                  print("Dein normales Symbol wurde als icon.png gespeichert.")
+              base_png = open(ICON_FILE, "rb").read()
+              base_hash = hashlib.sha1(base_png).hexdigest()[:12]
+              cache = state.setdefault("assets", {}).setdefault(base_hash, {})
+
+              found = next_event(now)
+              if found:
+                  ev, start = found
+                  hours = max(1, min(WINDOW_HOURS, math.ceil((start - now).total_seconds() / 3600)))
+                  want = f"h{hours}"
+                  print(f"Event '{ev.get('title')}' startet {start:%Y-%m-%d %H:%M} UTC -> {hours} HOURS")
+              else:
+                  want = "base"
+                  print("Kein Event in den naechsten 24 Stunden.")
+
+              if want == showing and state.get("base_hash", base_hash) == base_hash:
+                  print("Symbol ist schon richtig, nichts zu tun.")
+              else:
+                  if want not in cache:
+                      png = base_png if want == "base" else render_countdown(base_png, hours)
+                      cache[want] = upload_image(png, "Game Icon" if want == "base" else f"Countdown {hours}h")
+                  set_place_icon(cache[want])
+                  state["showing"] = want
+                  state["base_hash"] = base_hash
+                  print(f"Symbol gesetzt: {want} (Asset {cache[want]})")
+
+              # einmal pro Woche speichern, damit GitHub den Zeitplan nicht abschaltet
+              if state.get("keepalive", "") < (now - dt.timedelta(days=7)).isoformat():
+                  state["keepalive"] = now.isoformat()
+
+              json.dump(state, open(STATE_FILE, "w"), indent=2)
+
+
+          if __name__ == "__main__":
+              main()
+          PY
+          python /tmp/countdown.py
+
+      - name: Stand speichern
+        if: always()
+        run: |
+          git config user.name "countdown-bot"
+          git config user.email "countdown-bot@users.noreply.github.com"
+          for f in icon.png countdown-state.json; do [ -f "$f" ] && git add "$f"; done
+          git diff --cached --quiet || (git commit -m "Countdown-Symbol aktualisiert" && git push)
